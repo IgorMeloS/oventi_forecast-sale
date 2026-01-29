@@ -178,21 +178,6 @@ Metrics are reported per horizon and aggregated across horizons.
 WAPE is preferred over MAPE due to intermittent demand and zero-heavy series.
 
 ---
-
-## Installation
-
-This project is written in **Python 3.10+**.
-
-From the project root:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate        # Linux / Mac
-# .venv\Scripts\activate         # Windows
-
-pip install .
-
----
 ## Deployment (conceptual – GCP)
 
 This project is designed to be production-ready but is executed locally.
@@ -210,6 +195,23 @@ Typical GCP components could include:
 - **Cloud Scheduler** to orchestrate periodic runs.
 
 Cloud deployment is intentionally kept at a conceptual level; the focus of this project is on modeling choices, evaluation strategy, and production-oriented code structure.
+---
+
+## Installation
+
+This project is written in **Python 3.10+**.
+
+From the project root:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate        # Linux / Mac
+# .venv\Scripts\activate         # Windows
+
+pip install .
+
+---
+
 
 ## Command Line Interface (CLI)
 
