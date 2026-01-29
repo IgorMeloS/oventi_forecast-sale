@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+venv/
+
+# Data & artifacts
+data/
+models/
+reports/
+*.pkl
+*.joblib
+*.parquet
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+
+# Data & artifacts
+data/
+artifacts/
+
+# Python
+__pycache__/
+*.pyc
+*.pkl
+*.joblib
+
+# Virtual environments
+.venv/
+venv/
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/

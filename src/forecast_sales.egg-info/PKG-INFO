@@ -1,0 +1,385 @@
+Metadata-Version: 2.4
+Name: forecast-sales
+Version: 0.1.0
+Summary: Monthly retail sales forecasting (agency × sku, 4-month horizon)
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.24
+Requires-Dist: pandas>=2.0
+Requires-Dist: scikit-learn>=1.3
+Requires-Dist: lightgbm>=4.0
+Requires-Dist: joblib>=1.3
+Requires-Dist: pyarrow>=10.0
+
+# Forecast Sales — Store x Product (Monthly, 4-month horizon)
+
+## Problem statement
+We forecast monthly sales volumes for each (agency, sku) pair for the next 4 months.
+
+The objective is not to maximize raw predictive performance, but to demonstrate a clear, production-oriented end-to-end approach covering data understanding, modeling choices, evaluation strategy, and deployment considerations.
+
+---
+
+## Data understanding & EDA findings
+
+The dataset contains monthly sales histories for a fixed panel of store–product pairs.
+
+### Dataset overview
+- **Size**: ~21,000 rows, 26 columns.
+- **Entities**: 58 stores (agencies) × 25 products (SKUs), resulting in **350 distinct time series**.
+- **Time span**: January 2013 → December 2017.
+- **Granularity**: strictly monthly, with dates aligned on month start.
+- **Panel structure**: complete and balanced — each series contains **exactly 60 months**, with no missing periods.
+
+This complete panel structure simplifies feature engineering and time-based backtesting, as no gap-filling is required.
+
+### Target distribution
+- Sales volumes are **right-skewed** (skewness ≈ 2.65), with heavy tails.
+- Large outliers are present (p99 far above the median), likely driven by promotions, stock effects, or exceptional events.
+- Zero sales exist but are **not dominant globally** (~12% of observations); however, zeros are highly concentrated in a subset of series.
+
+### Intermittent and dormant demand
+- 54 series exhibit **long zero streaks (>12 consecutive months)**.
+- Among them, 49 series have **≥24 consecutive zero months**, indicating dormant or quasi-inactive products.
+- This suggests the coexistence of different demand regimes (regular vs. intermittent), which may require differentiated modeling strategies.
+
+### Data quality
+- No duplicate keys detected on (store_id, product_id, date).
+- No unparseable or inconsistent dates.
+- A small number of feature anomalies were identified (e.g. negative price, discount >100%) and must be sanitized in a production pipeline.
+
+---
+
+## Key assumptions
+- The monthly time index is complete and reliable.
+- Forecast horizon is fixed to 4 months for all series.
+- A **global forecasting model** (single model trained across all series) is preferred over per-series models.
+- Historical price and promotion variables are assumed to be known or proxied at prediction time.
+
+---
+
+## Modeling implications from EDA
+- The balanced panel structure supports a **global model** leveraging cross-series patterns.
+- Heavy-tailed targets and zeros motivate **robust metrics** such as WAPE and MAE; MAPE is avoided.
+- Intermittent and dormant series may require segmentation or alternative objectives in future iterations.
+- Outliers must be handled explicitly via robust loss functions, winsorization, or promotion-aware features.
+- Naive baselines provide a realistic lower bound, with WAPE ≈ 0.21 (last value) and ≈ 0.21 (seasonal naive).
+
+---
+## Feature engineering
+
+Feature engineering is designed to be **minimal, robust, and production-oriented**, leveraging the strictly monthly and complete panel structure of the dataset.  
+All features are constructed in a **causal manner**, using only information available up to the forecast origin.
+
+### Unit of modeling
+- One observation corresponds to a given `(agency, sku)` pair at a given **forecast origin month `t`**.
+- The target is a **4-dimensional vector**:
+  \[
+  Y(t) = [y_{t+1}, y_{t+2}, y_{t+3}, y_{t+4}]
+  \]
+- Sales volumes are optionally transformed using `log1p` during training to stabilize heavy-tailed distributions; predictions are inverse-transformed at inference time.
+
+---
+
+### Identifier features
+- `agency`
+- `sku`
+
+These identifiers allow the global model to learn cross-series patterns while remaining scalable.
+
+---
+
+### Sales history features (core signal)
+
+**Lagged values**
+- `lag_1, lag_2, lag_3, lag_4`
+- `lag_6`
+- `lag_12`
+
+These capture short-term dynamics as well as monthly seasonality effects.
+
+**Rolling statistics** (computed on shifted values to avoid leakage)
+- Rolling mean and standard deviation over windows of:
+  - 3 months
+  - 6 months
+  - 12 months
+
+Rolling features capture local trend and volatility while remaining robust to noise.
+
+---
+
+### Intermittence and dormancy features
+
+Given the presence of intermittent and dormant demand patterns, dedicated features are included:
+- `is_zero_lag1`: indicator of zero sales at `t-1`
+- `zeros_last_3`: number of zero-sales months over the last 3 periods
+- `nonzero_rate_12`: proportion of non-zero months over the last year
+- `time_since_last_sale`: number of months since the last positive sale (capped)
+
+These features help the model distinguish between regular demand and structurally inactive series.
+
+---
+
+### Calendar features
+- Month encoded using sine and cosine transforms
+- Quarter indicator
+- Global time index (`time_idx`) to capture long-term trends
+
+The dataset’s strict monthly frequency makes explicit calendar features effective and stable.
+
+---
+
+### Series-level profile features (train-only)
+
+To support global modeling across heterogeneous series, **static series descriptors** are computed **using training data only** and then reused for validation, testing, and inference:
+- `series_mean_train`
+- `series_std_train`
+- `series_nonzero_rate_train`
+- `series_age_train`
+
+These features provide context about the typical scale, variability, and activity level of each series without introducing data leakage.
+
+---
+
+### Exogenous variables (limited and robust)
+
+To reduce sensitivity to future covariate uncertainty, exogenous variables are used conservatively:
+
+**Price-related**
+- Lagged price (`price_lag1`)
+- Short rolling average of price
+
+**Promotion-related**
+- Binary indicator of promotion activity (`has_discount_lag1`)
+- Short rolling average of discount percentage (clipped to valid bounds)
+
+Raw future prices or promotions are intentionally excluded.
+
+---
+
+### Anti-leakage principles
+- All lagged and rolling features rely on values **strictly prior to the forecast origin**.
+- Series-level statistics are computed on the **training split only**.
+- No target encoding or future-dependent aggregation is used.
+
+---
+
+### Scope limitations
+Feature engineering intentionally excludes:
+- Revenue-based targets
+- Store-level or assortment-level aggregations
+- Probabilistic or quantile features
+- Learned embeddings (e.g., TFT / TSMixer)
+
+These extensions are considered out of scope for the current baseline and listed as future work.
+
+---
+### Feature selection strategy
+
+No explicit feature selection step is applied in the baseline pipeline.
+
+This is a deliberate design choice driven by the following considerations:
+- The main model is a **tree-based ensemble (LightGBM)**, which performs **implicit feature selection** through split gain and regularization.
+- The model is trained as a **global model across heterogeneous time series**; some features may be weak globally but informative for specific sub-populations.
+- Early feature pruning based on short validation windows can introduce instability or unintended bias.
+
+Instead, feature selection is performed **a priori by design**:
+- Only features with a clear temporal or business rationale are engineered.
+- Known non-informative or technical columns (e.g. CSV indices) are explicitly dropped.
+- Feature importance analysis and pruning are deferred to post-baseline iterations.
+
+This approach prioritizes robustness, interpretability, and reproducibility over aggressive optimization.
+
+---
+
+## Modeling choices (high-level)
+- **Baselines**: last-observation and seasonal naive to set a performance floor.
+- **Main model**: tree-based regression (e.g., Gradient Boosting / LightGBM) trained globally with time-series features (lags, rolling statistics, calendar features).
+- **Forecasting strategy**: fixed 4-month horizon, with a preference for direct multi-horizon modeling to avoid error accumulation.
+- **Evaluation**: time-based split and backtesting, aligned with realistic forecasting scenarios.
+
+---
+
+- **Evaluation**: time-based holdout split on forecast origins.
+  Due to the combination of long lags (up to 12 months) and a direct multi-horizon setup (H=4),
+  a separate validation window may contain no usable samples after warm-up.
+  In the baseline implementation, evaluation is therefore performed on a final holdout set when available,
+  and rolling backtesting is listed as a next step.
+
+
+---
+## Training pipeline details
+
+### Forecasting formulation
+- A **direct multi-horizon strategy** is used.
+- For each forecast origin `t`, the model predicts:
+  \[
+  [y_{t+1}, y_{t+2}, y_{t+3}, y_{t+4}]
+  \]
+- This avoids error accumulation associated with recursive forecasting.
+
+### Model
+- A single global model is trained using:
+  - `MultiOutputRegressor`
+  - `LightGBMRegressor` as the base estimator
+- This results in **one serialized model artifact** handling all horizons.
+
+### Warm-up handling
+- Long lags (12 months), rolling statistics, and multi-horizon targets require a warm-up period.
+- Rows with insufficient historical context or missing future targets are dropped prior to training.
+- As a consequence, the most recent months may not yield valid evaluation samples in small holdout windows.
+
+### Feature name sanitization
+- LightGBM enforces strict constraints on feature names.
+- All feature names are sanitized in the training pipeline to remove unsupported characters.
+- This step is systematic and transparent, ensuring compatibility with production environments.
+
+### Artifacts
+The training step produces the following artifacts:
+- `model.joblib`: trained multi-output LightGBM model
+- `series_profile.parquet`: train-only static descriptors per `(agency, sku)`
+- `features.json`: final feature list used by the model
+- `metadata.json`: training configuration and dataset summary
+- `metrics.json`: evaluation metrics when available
+
+---
+## Evaluation metrics
+
+### Metrics used
+
+Two complementary metrics are used to evaluate forecasting performance:
+
+- **MAE (Mean Absolute Error)**
+- **WAPE (Weighted Absolute Percentage Error)**
+
+Metrics are computed **per forecast horizon (H=1..4)** as well as **aggregated across horizons**.
+
+---
+
+### MAE — Mean Absolute Error
+
+MAE measures the average absolute deviation between predicted and actual sales volumes:
+
+\[
+MAE = \frac{1}{N} \sum_{i=1}^{N} |y_i - \hat{y}_i|
+\]
+
+**Why MAE?**
+- Expressed in the same unit as the target (sales volume).
+- Easy to interpret from a business perspective.
+- Robust to occasional large errors compared to squared-error metrics.
+
+MAE provides an intuitive sense of *how many units are missed on average*.
+
+---
+
+### WAPE — Weighted Absolute Percentage Error
+
+WAPE is defined as:
+
+\[
+WAPE = \frac{\sum |y_i - \hat{y}_i|}{\sum |y_i|}
+\]
+
+**Why WAPE?**
+- Commonly used in retail and demand forecasting.
+- More stable than MAPE in the presence of zero or near-zero demand.
+- Naturally **volume-weighted**, giving more importance to high-impact series.
+- Well aligned with business cost considerations.
+
+Given the presence of intermittent demand and heavy-tailed distributions, WAPE is preferred over MAPE.
+
+---
+
+### Horizon-wise evaluation
+
+Metrics are reported:
+- **Separately for each forecast horizon** (1 to 4 months ahead),
+- And as a simple average across horizons.
+
+This allows:
+- Diagnosing short-term vs longer-horizon degradation,
+- Comparing model behavior across lead times.
+
+---
+
+### Evaluation scope and fallback strategy
+
+Evaluation is performed on a **time-based holdout test set** when sufficient forecast origins remain after warm-up.
+
+Due to the combination of:
+- long historical features (up to 12-month lags),
+- rolling statistics,
+- and a direct multi-horizon setup,
+
+the final test window may contain **no valid samples** after feature construction.
+
+In such cases:
+- Metrics are computed on the **training set** as a **baseline sanity check**,
+- The evaluation scope (`train` or `test`) is explicitly stored in the training metadata.
+
+This behavior is intentional and documented; proper out-of-sample evaluation is handled in future iterations via rolling-origin backtesting.
+
+---
+
+### Metrics artifacts
+
+The training step produces two metric-related artifacts:
+- `metrics.json`: machine-readable metrics per horizon and aggregated
+- `metrics.csv`: human-readable tabular summary of metrics
+
+These artifacts ensure traceability and facilitate inspection during model iteration.
+
+---
+## Command Line Interface (CLI)
+
+The project provides a lightweight command-line interface to train the forecasting model and generate predictions.  
+All steps are executable from the terminal and follow a production-oriented workflow.
+
+The CLI exposes two main commands:
+- `train`: trains the model and produces all training artifacts
+- `predict`: generates future forecasts using saved artifacts
+
+---
+
+### Train
+
+The `train` command performs the full training pipeline:
+- temporal split on forecast origins,
+- feature engineering,
+- training of a global multi-horizon LightGBM model,
+- evaluation (test when available, otherwise train fallback),
+- serialization of all artifacts required for inference.
+
+```bash
+python -m src.forecast_sales.cli train \
+  --data-path data/ds_assortiment_dataset.csv \
+  --artifacts-dir artifacts/run_001 \
+  --target-transform log1p
+
+### Forecasting via CLI
+
+Forecast generation is executed through the command-line interface using the `predict` command.
+
+```bash
+python -m src.forecast_sales.cli predict \
+  --data-path data/ds_assortiment_dataset.csv \
+  --artifacts-dir artifacts/run_001 \
+  --output-path artifacts/run_001/predictions.csv
+
+
+## Installation
+
+The project uses a minimal set of Python dependencies and can be installed locally using `pip`.
+
+### Requirements
+- Python **3.10+**
+- `pip`
+
+### Install dependencies
+
+From the project root:
+
+```bash
+pip install .
+
